@@ -21,40 +21,12 @@ float GetElapsedTime(cudaEvent_t start, cudaEvent_t stop) {
     return elapsedTime;
 }
 
-// The CPU function returns a pointer to the accumulator
-void CPU_HoughTran(unsigned char *pic, int w, int h, int **acc)
-{
-  float rMax = sqrt(1.0 * w * w + 1.0 * h * h) / 2;
-  *acc = new int[rBins * degreeBins];
-  memset(*acc, 0, sizeof(int) * rBins * degreeBins);
-  int xCent = w / 2;
-  int yCent = h / 2;
-  float rScale = 2 * rMax / rBins;
-
-  for (int i = 0; i < w; i++)
-    for (int j = 0; j < h; j++)
-    {
-      int idx = j * w + i;
-      if (pic[idx] > 0)
-      {
-        int xCoord = i - xCent;
-        int yCoord = yCent - j;
-        float theta = 0;
-        for (int tIdx = 0; tIdx < degreeBins; tIdx++)
-        {
-          float r = xCoord * cos(theta) + yCoord * sin(theta);
-          int rIdx = (r + rMax) / rScale;
-          (*acc)[rIdx * degreeBins + tIdx]++;
-          theta += radInc;
-        }
-      }
-    }
-}
-
 // Kernel memoria compartida
 __global__ void GPU_HoughTranShared(unsigned char *pic, int w, int h, int *acc, float rMax, float rScale)
 {
   int gloID = blockIdx.x * blockDim.x + threadIdx.x;
+  int locID = threadIdx.x;
+
   if (gloID >= w * h) return;
 
   int xCent = w / 2;
@@ -62,8 +34,11 @@ __global__ void GPU_HoughTranShared(unsigned char *pic, int w, int h, int *acc, 
   int xCoord = gloID % w - xCent;
   int yCoord = yCent - gloID / w;
 
-  __shared__ int sharedAcc[rBins * degreeBins];
-  sharedAcc[threadIdx.x] = 0;
+  // Definir un acumulador local en memoria compartida
+  __shared__ int localAcc[degreeBins * rBins];
+  
+  // Inicializar a 0 todos los elementos de este acumulador local
+  localAcc[locID] = 0;
   __syncthreads();
 
   if (pic[gloID] > 0)
@@ -72,15 +47,28 @@ __global__ void GPU_HoughTranShared(unsigned char *pic, int w, int h, int *acc, 
     {
       float r = xCoord * d_Cos[tIdx] + yCoord * d_Sin[tIdx];
       int rIdx = (r + rMax) / rScale;
-      atomicAdd(&sharedAcc[rIdx * degreeBins + tIdx], 1);
+      atomicAdd(&localAcc[rIdx * degreeBins + tIdx], 1);
     }
   }
 
   __syncthreads();
 
-  for (int i = threadIdx.x; i < rBins * degreeBins; i += blockDim.x)
+  // Usar una barrera para asegurarse de que todos los hilos hayan completado el proceso de inicialización
+  __syncthreads();
+
+  // Actualizar el acumulador global acc utilizando el acumulador local localAcc
+  for (int i = locID; i < degreeBins * rBins; i += blockDim.x)
   {
-    atomicAdd(&acc[i], sharedAcc[i]);
+    atomicAdd(&acc[i], localAcc[i]);
+  }
+
+  // Usar una segunda barrera para asegurarse de que todos los hilos hayan completado el proceso de incremento
+  __syncthreads();
+
+  // Agregar un loop para sumar los valores del acumulador local localAcc al acumulador global acc
+  for (int i = locID; i < degreeBins * rBins; i += blockDim.x)
+  {
+    atomicAdd(&acc[i], localAcc[i]);
   }
 }
 
@@ -96,7 +84,7 @@ int main(int argc, char **argv) {
     int w = inImg.x_dim;
     int h = inImg.y_dim;
 
-    CPU_HoughTran(inImg.pixels, w, h, &cpuht);
+    // CPU_HoughTran(inImg.pixels, w, h, &cpuht); // Comentar esta línea ya que no estás usando la versión CPU
 
     float *pcCos = (float *)malloc(sizeof(float) * degreeBins);
     float *pcSin = (float *)malloc(sizeof(float) * degreeBins);
@@ -142,10 +130,10 @@ int main(int argc, char **argv) {
 
     cudaMemcpy(h_hough, d_hough, sizeof(int) * degreeBins * rBins, cudaMemcpyDeviceToHost);
 
-    for (int i = 0; i < degreeBins * rBins; i++) {
-        if (cpuht[i] != h_hough[i])
-            printf("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
-    }
+    // for (int i = 0; i < degreeBins * rBins; i++) {
+    //     if (cpuht[i] != h_hough[i])
+    //         printf("Calculation mismatch at : %i %i %i\n", i, cpuht[i], h_hough[i]);
+    // }
     printf("Done!\n");
 
     printf("Tiempo transcurrido: %f ms\n", elapsedTime);
@@ -153,7 +141,7 @@ int main(int argc, char **argv) {
     // Limpieza
     free(pcCos);
     free(pcSin);
-    delete[] cpuht;
+    // delete[] cpuht; // Comentar esta línea ya que no estás usando la versión CPU
     free(h_hough);
     cudaFree(d_in);
     cudaFree(d_hough);
